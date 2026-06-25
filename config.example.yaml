@@ -1,0 +1,65 @@
+# Example presto-mcp configuration (local / stdio shape).
+# Credentials are references only; the actual secret is resolved at connection
+# time (env://VAR or file://path; vault:// is reserved for a later phase).
+#
+# auth.scheme selects how the credential is sent:
+#   bearer (default) -> Authorization: Bearer <credential_ref>   (JWT / OAuth2 token)
+#   basic            -> Authorization: Basic  <user:password_ref> (requires https)
+# Omit any credential for an unsecured dev engine (user header only).
+
+deployment_mode: local        # local | enterprise
+
+server:
+  transport: stdio            # stdio (local) | http (enterprise, Phase 2)
+
+engines:
+  # 1) Unsecured dev engine: only the user header is sent, no token/password.
+  - id: dev-presto            # stable logical name; tools reference engines by this id
+    endpoint: http://presto-dev.internal:8080
+    dialect: presto           # presto | trino  (wxd is deferred)
+    auth:
+      mode: static            # static (local) | passthrough (enterprise, Phase 2)
+      user: analyst           # engine username (X-Presto-User / X-Trino-User)
+    history:
+      enabled: false          # no sink in Phase 1: queries come from coordinator memory
+
+  # 2) Bearer token (JWT / OAuth2). The ref resolves to the token string; you set
+  #    that env var (or file) to the token your identity platform issues.
+  - id: prod-trino
+    endpoint: https://trino-prod.internal:8443
+    dialect: trino
+    auth:
+      mode: static
+      scheme: bearer
+      user: analyst
+      credential_ref: env://TRINO_TOKEN        # or file:///etc/presto-mcp/trino-token
+    history:
+      enabled: false
+
+  # 3) Username / password (HTTP Basic auth, e.g. Trino LDAP or file authenticator).
+  #    Requires an https endpoint; the password is a reference, never inline.
+  - id: secure-trino
+    endpoint: https://trino-secure.internal:8443
+    dialect: trino
+    auth:
+      mode: static
+      scheme: basic
+      user: analyst                            # the account name (also the Basic user)
+      password_ref: env://TRINO_PASSWORD       # or file:///etc/presto-mcp/trino-password
+    # tls_insecure_skip_verify: true           # dev/test only: trust a self-signed cert
+    history:
+      enabled: false
+      # In Phase 2 a sink can be configured, e.g.:
+      # enabled: true
+      # provider: mysql_event_listener
+      # connection:
+      #   dsn_ref: vault://secret/trino/history-mysql
+      # mapping:
+      #   table: query_events
+      #   query_id: query_id
+      #   user: user
+      #   state: query_state
+      #   start_time: create_time
+      #   end_time: end_time
+      #   elapsed_ms: wall_time_ms
+      #   scanned_bytes: total_bytes
