@@ -17,8 +17,20 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# Build output
+/bin/
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
+design/
+design
+/design
+.claude
+.claude/
+/.claude
+
+# Local-only working guidance (kept private; the authoritative plan lives in design/)
+CLAUDE.md
 
 # Go workspace file
 go.work

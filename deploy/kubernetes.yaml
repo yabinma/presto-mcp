@@ -1,0 +1,85 @@
+# presto-mcp — enterprise (streamable-HTTP) deployment.
+#
+# The MCP holds no engine secret: in passthrough mode the caller's credential
+# rides each request. The only mounted material is the (non-secret) config and,
+# optionally, TLS / JWT public-key material referenced by file:// paths.
+#
+# Apply with: kubectl apply -f deploy/kubernetes.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: presto-mcp-config
+  labels: { app: presto-mcp }
+data:
+  config.yaml: |
+    deployment_mode: enterprise
+    server:
+      transport: http
+      http:
+        host: 0.0.0.0
+        port: 8080
+        # tls_cert_ref: file:///etc/presto-mcp/tls/tls.crt
+        # tls_key_ref:  file:///etc/presto-mcp/tls/tls.key
+        # edge_auth:
+        #   scheme: jwt_rs256
+        #   public_key_ref: file:///etc/presto-mcp/tls/jwt-pub.pem
+    engines:
+      - id: prod-trino
+        endpoint: https://trino-prod.internal:8443
+        dialect: trino
+        auth: { mode: passthrough }
+        history: { enabled: false }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: presto-mcp
+  labels: { app: presto-mcp }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: presto-mcp }
+  template:
+    metadata:
+      labels: { app: presto-mcp }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: presto-mcp
+          image: presto-mcp:dev   # replace with your registry/tag
+          args: ["--config", "/etc/presto-mcp/config.yaml"]
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/presto-mcp, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: presto-mcp-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: presto-mcp
+  labels: { app: presto-mcp }
+spec:
+  selector: { app: presto-mcp }
+  ports:
+    - { name: http, port: 80, targetPort: http }

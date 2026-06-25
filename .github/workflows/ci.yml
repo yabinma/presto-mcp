@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (e.g. new pushes to a PR).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Verify modules are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Vet (functional suite)
+        # Compile + vet the build-tagged functional code without Docker, for fast
+        # feedback before the heavy functional jobs run.
+        run: go vet -tags functional ./test/functional/...
+
+      - name: golangci-lint
+        # The action major must match the golangci-lint major (v2 config schema);
+        # the binary version is pinned for reproducible results across runs.
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.4
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests (race) + coverage gate (>= 80%)
+        run: ./scripts/check-coverage.sh
+        env:
+          GOFLAGS: -race
+
+      - name: Benchmarks (smoke, race-enabled)
+        run: go test -race -bench=. -benchmem -run='^$' -benchtime=10x ./...
+
+  docker:
+    # Validate the multi-stage image build (Dockerfile + version stamp).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        run: docker build --build-arg VERSION=ci-${{ github.sha }} -t presto-mcp:ci .
+
+  functional:
+    # Phase 1 in-process suite: every tool against real Trino + Presto in local mode
+    # (plain + TLS-secured basic/JWT, positive + wrong-credential-rejected).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Functional suite (local; Trino + Presto)
+        run: go test -tags functional -v -timeout 30m -run 'TestToolsAgainstEngines|TestSecuredBasicAuth|TestSecuredJWTAuth' ./test/functional/...
+
+  functional-enterprise:
+    # Enterprise suite: the presto-mcp image runs as a container alongside the
+    # engines and is driven over HTTP, proving passthrough end-to-end for both dialects.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Enterprise functional suite (HTTP + passthrough, containerized image)
+        run: go test -tags functional -v -timeout 30m -run 'TestEnterprisePassthrough' ./test/functional/...

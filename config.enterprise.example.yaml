@@ -1,0 +1,50 @@
+# Example presto-mcp configuration (enterprise / streamable-HTTP shape).
+#
+# In enterprise mode the server holds NO identity of its own: the caller's
+# credential rides each MCP request (Authorization header) and is forwarded to
+# the engine, which performs authn/authz (passthrough). No engine secret lives
+# in this file or the container image.
+
+deployment_mode: enterprise   # local | enterprise
+
+server:
+  transport: http             # enterprise default
+  http:
+    host: 0.0.0.0
+    port: 8080
+
+    # TLS for the MCP endpoint itself (references, never inline). Set both or
+    # neither. Strongly recommended in production so the forwarded bearer token
+    # is not exposed on the wire.
+    # tls_cert_ref: file:///etc/presto-mcp/tls.crt
+    # tls_key_ref:  file:///etc/presto-mcp/tls.key
+
+    # Origin-header allowlist (DNS-rebinding protection for browser clients).
+    # Omit to disable the check (e.g. when fronted by a trusted gateway).
+    # allowed_origins: ["https://agent.internal"]
+
+    # Edge auth is OPTIONAL and defaults to opaque passthrough (the Authorization
+    # header is forwarded unverified; the engine is the authority). Enable this
+    # block for defense-in-depth: the MCP verifies the caller's bearer token at
+    # the edge and forwards the verified subject as the engine user.
+    # edge_auth:
+    #   scheme: jwt_rs256
+    #   public_key_ref: file:///etc/presto-mcp/jwt-pub.pem
+
+engines:
+  - id: prod-trino            # stable logical name; tools reference engines by this id
+    endpoint: https://trino-prod.internal:8443
+    dialect: trino            # presto | trino  (wxd is deferred)
+    auth:
+      mode: passthrough       # forward the caller's credential; engine authorizes
+      # user: svc-fallback    # optional: engine user when the caller has no verified identity
+    history:
+      enabled: false          # history providers are deferred; queries come from coordinator memory
+
+  - id: prod-presto
+    endpoint: https://presto-prod.internal:8443
+    dialect: presto
+    auth:
+      mode: passthrough
+    history:
+      enabled: false
