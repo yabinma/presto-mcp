@@ -1,0 +1,198 @@
+name: Release
+
+# Manually triggered release workflow.
+#
+# Run it from the GitHub UI: Actions > Release > Run workflow, then enter the
+# version tag. It re-runs the full test suite as a release gate (race-enabled
+# unit tests + the >=80% coverage gate, plus the Docker-based functional suites
+# for both dialects and the enterprise HTTP/passthrough shape), then
+# cross-compiles the binaries, builds and pushes the distroless container image
+# to ghcr.io, and publishes a GitHub Release with the binaries and their
+# SHA-256 checksums. The tag is created at the released commit.
+#
+# Version format: vMAJOR.MINOR.PATCH (SemVer, e.g. v0.1.0), with an optional
+# pre-release suffix (e.g. v0.2.0-rc1). Mark such builds with the `prerelease`
+# input so they are flagged on GitHub and do not move the image `:latest` tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (SemVer, e.g. v0.1.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark this release as a pre-release'
+        required: false
+        type: boolean
+        default: false
+
+# Read-only by default; the publishing job widens this for itself.
+permissions:
+  contents: read
+
+# Never run two releases at the same time.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so the tag-exists check sees existing tags.
+          fetch-depth: 0
+
+      - name: Validate version and check the tag is new
+        run: |
+          VERSION="${{ inputs.version }}"
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Version '$VERSION' is invalid. Expected SemVer vMAJOR.MINOR.PATCH (e.g. v0.1.0)."
+            exit 1
+          fi
+          if git rev-parse "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag '$VERSION' already exists. Pick a new version."
+            exit 1
+          fi
+          echo "Releasing $VERSION"
+
+  # --- Release gate -------------------------------------------------------
+  # main is already gated by ci.yml, but these re-run the exact commit being
+  # released so nothing is published unless that commit is green. The three
+  # jobs run in parallel; the heavy functional suites need Docker (present on
+  # ubuntu-latest) and build their own engine + presto-mcp containers.
+
+  test-unit:
+    name: Unit tests + coverage gate
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (race) + coverage gate (>= 80%)
+        run: ./scripts/check-coverage.sh
+        env:
+          GOFLAGS: -race
+
+  test-functional:
+    name: Functional suite (Trino + Presto)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Functional suite (local; Trino + Presto)
+        run: go test -tags functional -v -timeout 30m -run 'TestToolsAgainstEngines|TestSecuredBasicAuth|TestSecuredJWTAuth' ./test/functional/...
+
+  test-functional-enterprise:
+    name: Enterprise functional suite (HTTP + passthrough)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Enterprise functional suite (containerized image)
+        run: go test -tags functional -v -timeout 30m -run 'TestEnterprisePassthrough' ./test/functional/...
+
+  # --- Publish ------------------------------------------------------------
+  release:
+    name: Build and Publish Release
+    needs: [test-unit, test-functional, test-functional-enterprise]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the tag + GitHub Release
+      packages: write   # push the image to ghcr.io
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so --generate-notes can diff against the previous tag.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Build release binaries
+        run: |
+          mkdir -p dist
+          PLATFORMS="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
+          for platform in $PLATFORMS; do
+            GOOS="${platform%/*}"
+            GOARCH="${platform#*/}"
+            output="presto-mcp_${VERSION}_${GOOS}_${GOARCH}"
+            [ "$GOOS" = "windows" ] && output="${output}.exe"
+            echo "Building dist/${output}"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath \
+                -ldflags "-s -w -X github.com/yabinma/presto-mcp/internal/server.Version=${VERSION}" \
+                -o "dist/${output}" ./cmd/presto-mcp
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          echo "Artifacts:"
+          cat SHA256SUMS
+
+      - name: Build and push container image to ghcr.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ghcr requires a lowercase image path.
+          IMAGE="ghcr.io/${{ github.repository }}"
+          IMAGE="${IMAGE,,}"
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker build \
+            --build-arg VERSION="${VERSION}" \
+            -t "${IMAGE}:${VERSION}" \
+            .
+          docker push "${IMAGE}:${VERSION}"
+          # Only move :latest for full (non-pre) releases.
+          if [ "${{ inputs.prerelease }}" != "true" ]; then
+            docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          # gh creates the tag "$VERSION" at the checked-out commit.
+          gh release create "$VERSION" \
+            --target "${{ github.sha }}" \
+            --title "$VERSION" \
+            --generate-notes \
+            $PRERELEASE_FLAG \
+            dist/*
