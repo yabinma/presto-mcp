@@ -554,9 +554,11 @@ func dumpLogs(t *testing.T, c testcontainers.Container) {
 	t.Logf("container logs (tail):\n%s", s)
 }
 
-// genSelfSignedPEM returns a PEM bundle (private key + certificate) for the
-// engine's PEM keystore, valid for localhost / 127.0.0.1 and the container
-// network aliases used by the enterprise suite ("trino", "presto").
+// genServerCertKey returns a self-signed certificate and its private key as
+// separate PEM blocks, valid for localhost / 127.0.0.1 and the container network
+// aliases used by the enterprise suite ("trino", "presto"). genSelfSignedPEM
+// bundles these for the engine's PEM keystore; the MCP edge's own TLS wants them
+// as the separate tls_cert_ref / tls_key_ref files.
 //
 // The aliases matter because newer engine images (e.g. prestodb/presto:latest)
 // bundle a Jetty with SNI host checking enabled: on an HTTPS connection it
@@ -564,7 +566,7 @@ func dumpLogs(t *testing.T, c testcontainers.Container) {
 // certificate. The local suite connects to 127.0.0.1, but the enterprise suite's
 // containerized client connects to https://<alias>:8443, so the alias must be in
 // the cert's SAN. (A real deployment uses a cert covering the engine's hostname.)
-func genSelfSignedPEM(t *testing.T) []byte {
+func genServerCertKey(t *testing.T) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
@@ -583,11 +585,17 @@ func genSelfSignedPEM(t *testing.T) []byte {
 	require.NoError(t, err)
 	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	require.NoError(t, err)
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM
+}
 
-	var buf bytes.Buffer
-	require.NoError(t, pem.Encode(&buf, &pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
-	require.NoError(t, pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der}))
-	return buf.Bytes()
+// genSelfSignedPEM returns a PEM bundle (private key + certificate) for the
+// engine's PEM keystore.
+func genSelfSignedPEM(t *testing.T) []byte {
+	t.Helper()
+	certPEM, keyPEM := genServerCertKey(t)
+	return append(append([]byte{}, keyPEM...), certPEM...)
 }
 
 // genPasswordDB returns a Trino file-authenticator entry: "user:<bcrypt>". Trino

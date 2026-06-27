@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -17,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -104,14 +106,24 @@ func startServer(t *testing.T, hc *config.HTTPConfig, reg *registry.Registry) st
 			t.Error("serveHTTP did not return after context cancel")
 		}
 	})
-	return "http://" + ln.Addr().String()
+	scheme := "http"
+	if hc.TLSCertRef != "" {
+		scheme = "https" // serveHTTP terminates TLS when a cert ref is configured
+	}
+	return scheme + "://" + ln.Addr().String()
 }
 
 func mcpHTTPClient(t *testing.T, base, authHeader string) *mcp.ClientSession {
+	return mcpHTTPClientRT(t, base, authHeader, http.DefaultTransport)
+}
+
+// mcpHTTPClientRT is mcpHTTPClient with a custom RoundTripper, e.g. an
+// insecure-TLS transport for connecting to the server's self-signed test cert.
+func mcpHTTPClientRT(t *testing.T, base, authHeader string, rt http.RoundTripper) *mcp.ClientSession {
 	t.Helper()
 	transport := &mcp.StreamableClientTransport{
 		Endpoint:   base,
-		HTTPClient: &http.Client{Transport: authRoundTripper{header: authHeader, base: http.DefaultTransport}},
+		HTTPClient: &http.Client{Transport: authRoundTripper{header: authHeader, base: rt}},
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil)
 	cs, err := client.Connect(context.Background(), transport, nil)
@@ -199,6 +211,60 @@ func TestServeHTTP_EdgeAuth(t *testing.T) {
 		_, err = client.Connect(context.Background(), transport, nil)
 		require.Error(t, err, "the MCP handshake must fail when the edge rejects the token")
 	})
+
+	t.Run("an expired token is rejected at the edge", func(t *testing.T) {
+		expired := signJWT(t, key, "alice", time.Now().Add(-time.Minute))
+		transport := &mcp.StreamableClientTransport{
+			Endpoint:   base,
+			HTTPClient: &http.Client{Transport: authRoundTripper{header: "Bearer " + expired, base: http.DefaultTransport}},
+		}
+		client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+		_, err := client.Connect(context.Background(), transport, nil)
+		require.Error(t, err, "an expired token must be rejected at the edge")
+	})
+
+	t.Run("a request with no token is rejected at the edge", func(t *testing.T) {
+		transport := &mcp.StreamableClientTransport{
+			Endpoint:   base,
+			HTTPClient: &http.Client{Transport: authRoundTripper{header: "", base: http.DefaultTransport}},
+		}
+		client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+		_, err := client.Connect(context.Background(), transport, nil)
+		require.Error(t, err, "a missing token must be rejected at the edge (no opaque pass-through)")
+	})
+}
+
+// TestServeHTTP_TLS proves the server terminates HTTPS itself when tls_cert_ref /
+// tls_key_ref are configured (serveHTTP's ServeTLS branch), and still forwards
+// the caller's credential over the encrypted transport.
+func TestServeHTTP_TLS(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	certPEM, keyPEM := genCertKeyPEM(t)
+	require.NoError(t, os.WriteFile(certPath, certPEM, 0o600))
+	require.NoError(t, os.WriteFile(keyPath, keyPEM, 0o600))
+
+	eng := newRecordingEngine(t)
+	hc := &config.HTTPConfig{
+		Host:       "127.0.0.1",
+		TLSCertRef: "file://" + certPath,
+		TLSKeyRef:  "file://" + keyPath,
+	}
+	base := startServer(t, hc, passthroughRegistry(t, eng.URL))
+	require.True(t, strings.HasPrefix(base, "https://"), "a TLS config must yield an https endpoint")
+
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // self-signed test cert
+	cs := mcpHTTPClientRT(t, base, "Bearer caller.jwt.token", tr)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "list_catalogs", Arguments: map[string]any{"engine": "e"},
+	})
+	require.NoError(t, err)
+	require.False(t, res.IsError, "tool error: %+v", res.Content)
+
+	gotAuth, _ := eng.seen()
+	assert.Equal(t, "Bearer caller.jwt.token", gotAuth, "the caller's credential must be forwarded over TLS")
 }
 
 func TestOriginGuard(t *testing.T) {
